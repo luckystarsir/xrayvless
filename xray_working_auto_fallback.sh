@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+set -e
+
+# Xray-core working script: VLESS + XHTTP + REALITY, VLESS + WS + TLS + CDN
+# ENC is auto-detected. If current Xray does not support VLESS decryption, it falls back to encryption=none automatically.
+
+echo "================================================="
+echo " Xray-core 可用版：自动检测 ENC，失败自动回退 none"
+echo " 1. VLESS + XHTTP + REALITY"
+echo " 2. VLESS + WS + TLS + CDN"
+echo "================================================="
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "请使用 root 运行：sudo bash $0"
+  exit 1
+fi
+
+random_port() { shuf -i 20000-50000 -n 1; }
+urlencode() { python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"; }
+
+INSTALL_REALITY=0
+INSTALL_WS=0
+ENABLE_ENC=0
+
+read -p "请选择协议，可多选：1=XHTTP+REALITY，2=WS+TLS+CDN，例如 1 2: " INSTALL_OPTIONS
+for opt in $INSTALL_OPTIONS; do
+  case "$opt" in
+    1) INSTALL_REALITY=1 ;;
+    2) INSTALL_WS=1 ;;
+  esac
+done
+
+if [ "$INSTALL_REALITY" = "0" ] && [ "$INSTALL_WS" = "0" ]; then
+  echo "未选择任何协议，退出。"
+  exit 0
+fi
+
+read -p "是否尝试启用 VLESS ENC？0=不启用，1=尝试启用并自动检测 [默认 0]: " ENABLE_ENC
+ENABLE_ENC=${ENABLE_ENC:-0}
+
+read -p "请输入 UUID，留空自动生成: " UUID
+UUID=${UUID:-$(cat /proc/sys/kernel/random/uuid)}
+
+REALITY_ADDRESS=""
+REALITY_PORT=""
+REALITY_SNI=""
+PRIVATE_KEY=""
+PUBLIC_KEY=""
+SHORT_ID=""
+
+WS_DOMAIN=""
+WS_PORT=""
+WS_PATH=""
+CDN_PREFERRED_MODE=0
+CDN_ADDRESS=""
+
+if [ "$INSTALL_REALITY" = "1" ]; then
+  echo ""
+  echo "配置 1) VLESS + XHTTP + REALITY"
+  read -p "请输入 REALITY 连接地址，VPS IP 或域名，留空自动获取公网 IPv4: " REALITY_ADDRESS
+  read -p "请输入 REALITY 端口 [默认随机，建议 443]: " REALITY_PORT
+  read -p "请输入 REALITY 伪装域名/SNI [默认 www.cloudflare.com]: " REALITY_SNI
+  REALITY_PORT=${REALITY_PORT:-$(random_port)}
+  REALITY_SNI=${REALITY_SNI:-www.cloudflare.com}
+fi
+
+if [ "$INSTALL_WS" = "1" ]; then
+  echo ""
+  echo "配置 2) VLESS + WS + TLS + CDN"
+  read -p "请输入 WS CDN 域名，例如 ws.example.com: " WS_DOMAIN
+  read -p "请输入 WS 回源端口 [默认随机]: " WS_PORT
+  read -p "请输入 WS Path [默认 /ws]: " WS_PATH
+  WS_PORT=${WS_PORT:-$(random_port)}
+  WS_PATH=${WS_PATH:-/ws}
+
+  echo ""
+  echo "CDN 优选设置："
+  echo "0) 不启用优选，客户端直连真实 CDN 域名"
+  echo "1) 启用优选域名/IP，默认 www.visa.cn"
+  read -p "请选择 [默认 0]: " CDN_PREFERRED_MODE
+  CDN_PREFERRED_MODE=${CDN_PREFERRED_MODE:-0}
+  if [ "$CDN_PREFERRED_MODE" = "1" ]; then
+    read -p "请输入 CDN 优选域名/IP [默认 www.visa.cn]: " CDN_ADDRESS
+    CDN_ADDRESS=${CDN_ADDRESS:-www.visa.cn}
+  fi
+fi
+
+echo ""
+echo "安装依赖..."
+apt update -y
+apt install -y curl unzip socat openssl nginx python3 coreutils
+
+if [ "$INSTALL_REALITY" = "1" ] && [ -z "$REALITY_ADDRESS" ]; then
+  REALITY_ADDRESS=$(curl -4s --max-time 5 https://api.ipify.org || true)
+  if [ -z "$REALITY_ADDRESS" ]; then
+    REALITY_ADDRESS=$(hostname -I | awk '{print $1}')
+  fi
+fi
+
+echo ""
+echo "安装 / 更新 Xray-core..."
+bash <(curl -Ls https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh) install
+
+if [ "$INSTALL_REALITY" = "1" ]; then
+  echo ""
+  echo "生成 REALITY 密钥..."
+  KEYS=$(/usr/local/bin/xray x25519)
+  PRIVATE_KEY=$(echo "$KEYS" | grep -i "Private" | head -n1 | cut -d ':' -f2 | tr -d '[:space:]')
+  PUBLIC_KEY=$(echo "$KEYS" | grep -i "Public" | head -n1 | cut -d ':' -f2 | tr -d '[:space:]')
+  SHORT_ID=$(openssl rand -hex 8)
+  if [ -z "$PRIVATE_KEY" ] || [ -z "$PUBLIC_KEY" ]; then
+    echo "REALITY 密钥生成失败，xray x25519 输出如下："
+    echo "$KEYS"
+    exit 1
+  fi
+fi
+
+mkdir -p /usr/local/etc/xray/
+
+make_config() {
+  local decryption="$1"
+  export INSTALL_REALITY INSTALL_WS UUID REALITY_PORT REALITY_SNI PRIVATE_KEY SHORT_ID WS_PORT WS_PATH
+  export VLESS_DECRYPTION="$decryption"
+  python3 <<'PY'
+import json, os
+inbounds=[]
+uuid=os.environ['UUID']
+dec=os.environ.get('VLESS_DECRYPTION','none')
+if os.environ.get('INSTALL_REALITY')=='1':
+    inbounds.append({
+        'tag':'vless-xhttp-reality',
+        'listen':'0.0.0.0',
+        'port':int(os.environ['REALITY_PORT']),
+        'protocol':'vless',
+        'settings':{'clients':[{'id':uuid,'email':'xhttp-reality'}],'decryption':dec},
+        'streamSettings':{
+            'network':'xhttp',
+            'security':'reality',
+            'realitySettings':{
+                'show':False,
+                'dest':os.environ['REALITY_SNI']+':443',
+                'xver':0,
+                'serverNames':[os.environ['REALITY_SNI']],
+                'privateKey':os.environ['PRIVATE_KEY'],
+                'shortIds':[os.environ['SHORT_ID']]
+            }
+        }
+    })
+if os.environ.get('INSTALL_WS')=='1':
+    inbounds.append({
+        'tag':'vless-ws-cdn',
+        'listen':'127.0.0.1',
+        'port':int(os.environ['WS_PORT']),
+        'protocol':'vless',
+        'settings':{'clients':[{'id':uuid,'email':'ws-cdn'}],'decryption':dec},
+        'streamSettings':{'network':'ws','security':'none','wsSettings':{'path':os.environ['WS_PATH']}}
+    })
+config={'log':{'loglevel':'warning'},'inbounds':inbounds,'outbounds':[{'protocol':'freedom','tag':'direct'},{'protocol':'blackhole','tag':'block'}]}
+open('/usr/local/etc/xray/config.json','w').write(json.dumps(config,indent=2,ensure_ascii=False))
+PY
+}
+
+VLESS_DECRYPTION="none"
+VLESS_ENCRYPTION="none"
+
+if [ "$ENABLE_ENC" = "1" ]; then
+  echo ""
+  echo "尝试检测 VLESS ENC 支持..."
+  # 当前版本若不支持会自动回退，不会中断安装。
+  CANDIDATE_DECRYPTION="mlkem768x25519plus.native.600s"
+  CANDIDATE_ENCRYPTION="mlkem768x25519plus.native.0rtt"
+  make_config "$CANDIDATE_DECRYPTION"
+  if /usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json >/tmp/xray-enc-test.log 2>&1; then
+    VLESS_DECRYPTION="$CANDIDATE_DECRYPTION"
+    VLESS_ENCRYPTION="$CANDIDATE_ENCRYPTION"
+    echo "ENC 检测通过，已启用。"
+  else
+    echo "ENC 检测失败，当前 Xray 不支持该 decryption，自动回退 encryption=none。"
+    echo "失败日志："
+    cat /tmp/xray-enc-test.log
+    VLESS_DECRYPTION="none"
+    VLESS_ENCRYPTION="none"
+  fi
+fi
+
+make_config "$VLESS_DECRYPTION"
+
+echo ""
+echo "检查最终 Xray 配置..."
+/usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json
+
+if [ "$INSTALL_WS" = "1" ]; then
+  echo ""
+  echo "配置 Nginx TLS + WS 反代..."
+  mkdir -p /etc/nginx/conf.d/ /etc/ssl/xray/
+  openssl req -x509 -nodes -days 3650 \
+    -newkey rsa:2048 \
+    -keyout /etc/ssl/xray/ws.key \
+    -out /etc/ssl/xray/ws.crt \
+    -subj "/CN=$WS_DOMAIN"
+
+  cat > /etc/nginx/conf.d/xray-ws-cdn.conf <<EOF_NGX
+server {
+    listen 443 ssl http2;
+    server_name $WS_DOMAIN;
+
+    ssl_certificate /etc/ssl/xray/ws.crt;
+    ssl_certificate_key /etc/ssl/xray/ws.key;
+
+    location $WS_PATH {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:$WS_PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+
+    location / {
+        return 200 "ok";
+        add_header Content-Type text/plain;
+    }
+}
+EOF_NGX
+  nginx -t
+  systemctl enable nginx
+  systemctl restart nginx
+fi
+
+systemctl enable xray
+systemctl restart xray
+
+ENC_URL=$(urlencode "$VLESS_ENCRYPTION")
+OUTPUT_FILE=~/vless-working-client.txt
+cat > "$OUTPUT_FILE" <<EOF_OUT
+=================================================
+Xray-core 可用版客户端信息
+=================================================
+UUID: $UUID
+Client Encryption: $VLESS_ENCRYPTION
+Server Decryption: $VLESS_DECRYPTION
+
+EOF_OUT
+
+if [ "$INSTALL_REALITY" = "1" ]; then
+  REALITY_LINK="vless://${UUID}@${REALITY_ADDRESS}:${REALITY_PORT}?encryption=${ENC_URL}&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=xhttp#VLESS-XHTTP-REALITY"
+  cat >> "$OUTPUT_FILE" <<EOF_OUT
+=================================================
+VLESS + XHTTP + REALITY
+=================================================
+$REALITY_LINK
+
+REALITY 连接地址: $REALITY_ADDRESS
+REALITY 端口: $REALITY_PORT
+REALITY SNI: $REALITY_SNI
+REALITY PublicKey: $PUBLIC_KEY
+REALITY ShortID: $SHORT_ID
+Transport: xhttp
+
+EOF_OUT
+fi
+
+if [ "$INSTALL_WS" = "1" ]; then
+  WS_CLIENT_ADDRESS="$WS_DOMAIN"
+  if [ "$CDN_PREFERRED_MODE" = "1" ]; then
+    WS_CLIENT_ADDRESS="$CDN_ADDRESS"
+    CDN_STATUS="启用：$CDN_ADDRESS"
+  else
+    CDN_STATUS="未启用"
+  fi
+  WS_PATH_URL=$(urlencode "$WS_PATH")
+  WS_LINK="vless://${UUID}@${WS_CLIENT_ADDRESS}:443?encryption=${ENC_URL}&security=tls&type=ws&host=${WS_DOMAIN}&path=${WS_PATH_URL}&sni=${WS_DOMAIN}&fp=chrome&alpn=h2%2Chttp%2F1.1#VLESS-WS-TLS-CDN"
+  cat >> "$OUTPUT_FILE" <<EOF_OUT
+=================================================
+VLESS + WS + TLS + CDN
+=================================================
+$WS_LINK
+
+WS CDN 真实域名: $WS_DOMAIN
+WS 客户端连接地址: $WS_CLIENT_ADDRESS
+WS Path: $WS_PATH
+WS 回源端口: $WS_PORT
+CDN 优选状态: $CDN_STATUS
+
+EOF_OUT
+fi
+
+cat >> "$OUTPUT_FILE" <<EOF_OUT
+=================================================
+排错命令
+=================================================
+systemctl status xray --no-pager
+journalctl -u xray -n 80 --no-pager
+systemctl status nginx --no-pager
+nginx -t
+ss -lntp
+
+=================================================
+说明
+=================================================
+1. 这版会先测试 Xray 配置，能通过才重启服务。
+2. 如果 ENC 不被当前 Xray 支持，会自动回退 encryption=none。
+3. REALITY 使用 type=xhttp。
+4. WS + TLS + CDN 需要 Cloudflare DNS 开橙云，SSL/TLS 用 Full，不要用 Flexible。
+EOF_OUT
+
+echo ""
+echo "================================================="
+echo " 安装完成，客户端信息如下"
+echo "================================================="
+cat "$OUTPUT_FILE"
+echo ""
+echo "客户端信息已保存到：$OUTPUT_FILE"
